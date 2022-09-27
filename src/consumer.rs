@@ -10,8 +10,8 @@ use chrono::{DateTime, Utc};
 use futures::channel::mpsc::unbounded;
 use futures::task::{Context, Poll};
 use futures::{
-    channel::{mpsc, oneshot}, 
-    future::{select, try_join_all, Either}, 
+    channel::{mpsc, oneshot},
+    future::{select, try_join_all, Either},
     pin_mut, Future, FutureExt, SinkExt, Stream, StreamExt,
 };
 use regex::Regex;
@@ -760,7 +760,6 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
 }
 
 enum EngineEvent<Exe: Executor> {
-    Noop,
     Message(RawMessage),
     EngineMessage(EngineMessage<Exe>),
 }
@@ -776,8 +775,8 @@ struct ConsumerEngine<Exe: Executor> {
     tx: mpsc::Sender<Result<(proto::MessageIdData, Payload), Error>>,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
-    event_rx: tokio::sync::mpsc::Receiver<EngineEvent<Exe>>,
-    event_tx: tokio::sync::mpsc::Sender<EngineEvent<Exe>>,
+    event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
+    event_tx: mpsc::UnboundedSender<EngineEvent<Exe>>,
     batch_size: u32,
     remaining_messages: u32,
     unacked_message_redelivery_delay: Option<Duration>,
@@ -812,7 +811,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         options: ConsumerOptions,
         _drop_signal: oneshot::Sender<()>,
     ) -> ConsumerEngine<Exe> {
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::unbounded();
         ConsumerEngine {
             client,
             connection,
@@ -842,7 +841,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         let mut messages_rx = self.messages_rx
             .take()
             .expect("message_rx is None");
-        let event_msg_tx = self.event_tx.clone();
+        let mut event_msg_tx = self.event_tx.clone();
 
         self.client.executor.spawn(Box::pin(async move {
             while let Some(msg) = messages_rx.next().await {
@@ -857,7 +856,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         let mut engine_rx = self.engine_rx
             .take()
             .expect("engine_rx is None");
-        let event_ngmsg_tx = self.event_tx.clone();
+        let mut event_ngmsg_tx = self.event_tx.clone();
 
         self.client.executor.spawn(Box::pin(async move {
             while let Some(msg) = engine_rx.next().await {
@@ -868,17 +867,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             }
             log::warn!("engine_rx terminated");
         })).expect("Error spawining EngineMessage check");
-
-        let event_tick_tx = self.event_tx.clone();
-        self.client.executor.spawn(Box::pin(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let r = event_tick_tx.send(EngineEvent::Noop).await;
-                if let Err(err) = r {
-                    log::error!("EngineMessage Noop - {err}");
-                }
-            }
-        })).expect("Error spawining ticker");
 
         loop {
             if !self.connection.is_valid() {
@@ -910,27 +898,37 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 self.remaining_messages = self.batch_size;
             }
 
-            if let Some(event) = self.event_rx.recv().await {
-                match event {
-                    EngineEvent::Noop => {}
-                    EngineEvent::Message(msg) => {
-                        let out = self.handle_message_opt(Some(msg)).await;
-                        if let Some(res) = out {
-                            return res;
-                        }
-                    }
-                    EngineEvent::EngineMessage(msg) => {
-                        let continue_loop = self.handle_ack_opt(Some(msg));
-                        if !continue_loop {
-                            return Ok(());
-                        }
+            match Self::timeout(self.event_rx.next(), Duration::from_secs(1)).await {
+                Err(_timeout) => {}
+                Ok(Some(EngineEvent::Message(msg))) => {
+                    let out = self.handle_message_opt(Some(msg)).await;
+                    if let Some(res) = out {
+                        return res;
                     }
                 }
-            } else {
-                log::warn!("Event stream is terminated");
-                return Ok(());
+                Ok(Some(EngineEvent::EngineMessage(msg))) => {
+                    let continue_loop = self.handle_ack_opt(Some(msg));
+                    if !continue_loop {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => {
+                    log::warn!("Event stream is terminated");
+                    return Ok(());
+                }
             }
         }
+    }
+
+    #[cfg(feature = "async-std")]
+    async fn timeout<F: Future<Output=O>, O>(fut: F, dur: Duration) -> Result<O, async_std::future::TimeoutError> {
+        use async_std::prelude::FutureExt;
+        fut.timeout(dur).await
+    }
+
+    #[cfg(all(not(feature = "async-std"),feature = "tokio"))]
+    async fn timeout<F: Future<Output=O>, O>(fut: F, dur: Duration) -> Result<O, tokio::time::error::Elapsed> {
+        tokio::time::timeout_at(tokio::time::Instant::now() + dur, fut).await
     }
 
     async fn _engine(&mut self) -> Result<(), Error> {
