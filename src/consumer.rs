@@ -9,11 +9,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use futures::channel::mpsc::unbounded;
 use futures::task::{Context, Poll};
-use futures::{
-    channel::{mpsc, oneshot},
-    future::{select, try_join_all, Either},
-    pin_mut, Future, FutureExt, SinkExt, Stream, StreamExt,
-};
+use futures::{channel::{mpsc, oneshot}, future::{select, try_join_all, Either}, pin_mut, Future, FutureExt, SinkExt, Stream, StreamExt, TryStreamExt};
 use regex::Regex;
 
 use crate::connection::Connection;
@@ -32,6 +28,7 @@ use core::iter;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use std::convert::TryFrom;
+use futures::stream::FusedStream;
 use url::Url;
 
 /// Configuration options for consumers
@@ -572,11 +569,13 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             let mut interval = client.executor.interval(Duration::from_millis(500));
             let res = client.executor.spawn(Box::pin(async move {
                 while interval.next().await.is_some() {
+                    log::debug!("Sending unacked redelivery.");
                     if redelivery_tx
                         .send(EngineMessage::UnackedRedelivery)
                         .await
                         .is_err()
                     {
+                        log::error!("Error sending redeliver. Stopping ticker");
                         // Consumer shut down - stop ticker
                         break;
                     }
@@ -660,6 +659,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 
     pub async fn ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
+        log::info!("Sending ack to msg: {:?}", msg.message_id);
         self.engine_tx
             .send(EngineMessage::Ack(msg.message_id.clone(), false))
             .await?;
@@ -757,6 +757,12 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
     }
 }
 
+enum EngineEvent<Exe: Executor> {
+    Noop,
+    Message(RawMessage),
+    EngineMessage(EngineMessage<Exe>),
+}
+
 struct ConsumerEngine<Exe: Executor> {
     client: Pulsar<Exe>,
     connection: Arc<Connection<Exe>>,
@@ -768,6 +774,8 @@ struct ConsumerEngine<Exe: Executor> {
     tx: mpsc::Sender<Result<(proto::MessageIdData, Payload), Error>>,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
+    event_rx: tokio::sync::mpsc::Receiver<EngineEvent<Exe>>,
+    event_tx: tokio::sync::mpsc::Sender<EngineEvent<Exe>>,
     batch_size: u32,
     remaining_messages: u32,
     unacked_message_redelivery_delay: Option<Duration>,
@@ -802,6 +810,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         options: ConsumerOptions,
         _drop_signal: oneshot::Sender<()>,
     ) -> ConsumerEngine<Exe> {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
         ConsumerEngine {
             client,
             connection,
@@ -819,14 +828,117 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             unacked_messages: HashMap::new(),
             dead_letter_policy,
             options,
+            event_rx,
+            event_tx,
             _drop_signal,
         }
     }
 
     async fn engine(&mut self) -> Result<(), Error> {
         debug!("starting the consumer engine for topic {}", self.topic);
+
+        let mut messages_rx = self.messages_rx
+            .take()
+            .expect("message_rx is None");
+        let event_msg_tx = self.event_tx.clone();
+
+        self.client.executor.spawn(Box::pin(async move {
+            while let Some(msg) = messages_rx.next().await {
+                let r = event_msg_tx.send(EngineEvent::Message(msg)).await;
+                if let Err(err) = r {
+                    log::error!("Message SendError - {err}");
+                }
+            }
+            log::debug!("messages_rx terminated");
+        }));
+
+        let mut engine_rx = self.engine_rx
+            .take()
+            .expect("engine_rx is None");
+        let event_ngmsg_tx = self.event_tx.clone();
+
+        self.client.executor.spawn(Box::pin(async move {
+            while let Some(msg) = engine_rx.next().await {
+                let r = event_ngmsg_tx.send(EngineEvent::EngineMessage(msg)).await;
+                if let Err(err) = r {
+                    log::error!("EngineMessage SendError - {err}");
+                }
+            }
+            log::debug!("engine_rx terminated");
+        }));
+
+        let event_tick_tx = self.event_tx.clone();
+        self.client.executor.spawn(Box::pin(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let r = event_tick_tx.send(EngineEvent::Noop).await;
+                if let Err(err) = r {
+                    log::error!("EngineMessage Noop - {err}");
+                }
+
+            }
+        }));
+
+        loop {
+            log::debug!("Looping engine");
+            if !self.connection.is_valid() {
+                if let Some(err) = self.connection.error() {
+                    error!(
+                        "Consumer: connection {} is not valid: {:?}",
+                        self.connection.id(),
+                        err
+                    );
+                    self.reconnect().await?;
+                }
+            }
+
+            log::debug!("remaining_messages {} batch_size {}", self.remaining_messages, self.batch_size);
+            if self.remaining_messages < self.batch_size / 2 {
+                match self
+                    .connection
+                    .sender()
+                    .send_flow(self.id, self.batch_size - self.remaining_messages)
+                {
+                    Ok(()) => {}
+                    Err(ConnectionError::Disconnected) => {
+                        self.reconnect().await?;
+                        self.connection
+                            .sender()
+                            .send_flow(self.id, self.batch_size - self.remaining_messages)?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                self.remaining_messages = self.batch_size;
+            }
+
+            if let Some(event) = self.event_rx.recv().await {
+                match event {
+                    EngineEvent::Noop => {},
+                    EngineEvent::Message(msg) => {
+                        let out = self.handle_message_opt(Some(msg)).await;
+                        if let Some(res) = out {
+                            return res;
+                        }
+                    },
+                    EngineEvent::EngineMessage(msg) => {
+                        let continue_loop = self.handle_ack_opt(Some(msg));
+                        if !continue_loop {
+                            return Ok(());
+                        }
+                    }
+                }
+            } else {
+                log::warn!("Event stream is terminated");
+                return Ok(());
+            }
+        }
+    }
+
+    async fn _engine(&mut self) -> Result<(), Error> {
+        debug!("starting the consumer engine for topic {}", self.topic);
         let mut messages_or_ack_f = None;
         loop {
+            log::debug!("Looping engine");
             if !self.connection.is_valid() {
                 if let Some(err) = self.connection.error() {
                     error!(
@@ -856,6 +968,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 self.remaining_messages = self.batch_size;
             }
 
+            if messages_or_ack_f.is_none() {
+                let terminated = self.engine_rx.as_ref().map(|c| c.is_terminated()).unwrap_or(true);
+                if self.engine_rx.is_none() {
+                    log::warn!("engine_rs is empty");
+                } else if terminated {
+                    log::warn!("engine_rx is terminated");
+                }
+            }
+
             let mut f = match messages_or_ack_f.take() {
                 None => {
                     // we need these complicated steps to select on two streams of different types,
@@ -863,17 +984,22 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     // and replacing messages_rx when we reconnect, and considering that engine_rx is
                     // not clonable.
                     // Please, someone find a better solution
+                    log::debug!("Building select statement");
                     let messages_f = self.messages_rx.take().unwrap().into_future();
                     let ack_f = self.engine_rx.take().unwrap().into_future();
                     select(messages_f, ack_f)
                 }
-                Some(f) => f,
+                Some(f) => {
+                    log::debug!("Already have messages_or_ack_f");
+                    f
+                },
             };
 
             // we want to wake up regularly to check if the connection is still valid:
             // if the heartbeat failed, the connection.is_valid() call at the beginning
             // of the loop should fail, but to get there we must stop waiting on
             // messages_f and ack_f
+
             let delay_f = self.client.executor.delay(Duration::from_secs(1));
             let f_pin = std::pin::Pin::new(&mut f);
             pin_mut!(delay_f);
@@ -888,101 +1014,136 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
             match f {
                 Either::Left(((message_opt, messages_rx), engine_rx)) => {
+                    log::debug!("Sending message => {message_opt:?}");
                     self.messages_rx = Some(messages_rx);
                     self.engine_rx = engine_rx.into_inner();
-                    match message_opt {
-                        None => {
-                            error!("Consumer: messages::next: returning Disconnected");
-                            self.reconnect().await?;
-                            continue;
-                            //return Err(Error::Consumer(ConsumerError::Connection(ConnectionError::Disconnected)).into());
-                        }
-                        Some(message) => {
-                            self.remaining_messages -= message
-                                .payload
-                                .as_ref()
-                                .and_then(|payload| payload.metadata.num_messages_in_batch)
-                                .unwrap_or(1i32)
-                                as u32;
-
-                            match self.process_message(message).await {
-                                // Continue
-                                Ok(true) => {}
-                                // End of Topic
-                                Ok(false) => {
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    if let Err(e) = self.tx.send(Err(e)).await {
-                                        error!("cannot send a message from the consumer engine to the consumer({}), stopping the engine", self.id);
-                                        return Err(Error::Consumer(e.into()));
-                                    }
-                                }
-                            }
-                        }
+                    match self.handle_message_opt(message_opt).await {
+                        Some(res) => {
+                            log::warn!("[mesg] Terminating loop");
+                            return res;
+                        },
+                        None => {},
                     }
                 }
                 Either::Right(((ack_opt, engine_rx), messages_rx)) => {
+                    log::debug!("engine message");
                     self.messages_rx = messages_rx.into_inner();
                     self.engine_rx = Some(engine_rx);
 
-                    match ack_opt {
-                        None => {
-                            trace!("ack channel was closed");
-                            return Ok(());
-                        }
-                        Some(EngineMessage::Ack(message_id, cumulative)) => {
-                            self.ack(message_id, cumulative);
-                        }
-                        Some(EngineMessage::Nack(message_id)) => {
-                            if let Err(e) = self
-                                .connection
-                                .sender()
-                                .send_redeliver_unacknowleged_messages(
-                                    self.id,
-                                    vec![message_id.id.clone()],
-                                )
-                            {
-                                error!(
-                                    "could not ask for redelivery for message {:?}: {:?}",
-                                    message_id, e
-                                );
-                            }
-                        }
-                        Some(EngineMessage::UnackedRedelivery) => {
-                            let mut h = HashSet::new();
-                            let now = Instant::now();
-                            //info!("unacked messages length: {}", self.unacked_messages.len());
-                            for (id, t) in self.unacked_messages.iter() {
-                                if *t < now {
-                                    h.insert(id.clone());
-                                }
-                            }
-
-                            let ids: Vec<_> = h.iter().cloned().collect();
-                            if !ids.is_empty() {
-                                //info!("will unack ids: {:?}", ids);
-                                if let Err(e) = self
-                                    .connection
-                                    .sender()
-                                    .send_redeliver_unacknowleged_messages(self.id, ids)
-                                {
-                                    error!("could not ask for redelivery: {:?}", e);
-                                } else {
-                                    for i in h.iter() {
-                                        self.unacked_messages.remove(i);
-                                    }
-                                }
-                            }
-                        }
-                        Some(EngineMessage::GetConnection(sender)) => {
-                            let _ = sender.send(self.connection.clone()).map_err(|_| {
-                                error!("consumer requested the engine's connection but dropped the channel before receiving");
-                            });
-                        }
+                    let continue_loop = self.handle_ack_opt(ack_opt);
+                    if !continue_loop {
+                        log::warn!("[ack_opt] Terminating loop");
+                        break Ok(());
                     }
                 }
             };
+        }
+    }
+
+    async fn handle_message_opt(&mut self, message_opt: Option<crate::message::Message>) -> Option<Result<(), Error>> {
+        match message_opt {
+            None => {
+                error!("Consumer: messages::next: returning Disconnected");
+                if let Err(err) = self.reconnect().await {
+                    Some(Err(err))
+                } else {
+                    None
+                }
+                //return Err(Error::Consumer(ConsumerError::Connection(ConnectionError::Disconnected)).into());
+            }
+            Some(message) => {
+                self.remaining_messages -= message
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.metadata.num_messages_in_batch)
+                    .unwrap_or(1i32)
+                    as u32;
+
+                match self.process_message(message).await {
+                    // Continue
+                    Ok(true) => {
+                        log::debug!("Continue...");
+                        None
+                    }
+                    // End of Topic
+                    Ok(false) => {
+                        log::debug!("End of topic");
+                        Some(Ok(()))
+                    }
+                    Err(e) => {
+                        if let Err(e) = self.tx.send(Err(e)).await {
+                            error!("cannot send a message from the consumer engine to the consumer({}), stopping the engine", self.id);
+                            Some(Err(Error::Consumer(e.into())))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_ack_opt(&mut self, ack_opt: Option<EngineMessage<Exe>>) -> bool {
+        match ack_opt {
+            None => {
+                log::warn!("Closed ack channel!!!");
+                trace!("ack channel was closed");
+                false
+            }
+            Some(EngineMessage::Ack(message_id, cumulative)) => {
+                log::debug!("!!! Sending ack");
+                self.ack(message_id, cumulative);
+                true
+            }
+            Some(EngineMessage::Nack(message_id)) => {
+                if let Err(e) = self
+                    .connection
+                    .sender()
+                    .send_redeliver_unacknowleged_messages(
+                        self.id,
+                        vec![message_id.id.clone()],
+                    )
+                {
+                    error!(
+                                    "could not ask for redelivery for message {:?}: {:?}",
+                                    message_id, e
+                                );
+                }
+                true
+            }
+            Some(EngineMessage::UnackedRedelivery) => {
+                let mut h = HashSet::new();
+                let now = Instant::now();
+                log::info!("unacked messages length: {}", self.unacked_messages.len());
+                for (id, t) in self.unacked_messages.iter() {
+                    if *t < now {
+                        h.insert(id.clone());
+                    }
+                }
+
+                let ids: Vec<_> = h.iter().cloned().collect();
+                if !ids.is_empty() {
+                    log::info!("will unack ids: {:?}", ids);
+                    if let Err(e) = self
+                        .connection
+                        .sender()
+                        .send_redeliver_unacknowleged_messages(self.id, ids)
+                    {
+                        error!("could not ask for redelivery: {:?}", e);
+                    } else {
+                        for i in h.iter() {
+                            self.unacked_messages.remove(i);
+                        }
+                    }
+                }
+                true
+            }
+            Some(EngineMessage::GetConnection(sender)) => {
+                let _ = sender.send(self.connection.clone()).map_err(|_| {
+                    error!("consumer requested the engine's connection but dropped the channel before receiving");
+                });
+                true
+            }
         }
     }
 
@@ -1034,6 +1195,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     },
                 payload: Some(payload),
             } => {
+                log::debug!("Will process payload");
                 self.process_payload(message, payload).await?;
             }
             RawMessage {

@@ -126,6 +126,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
         }
 
         //Are we worried about starvation here?
+        log::debug!("Looping registrations");
         loop {
             match self.registrations.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Register::Request { key, resolver })) => {
@@ -142,6 +143,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                     consumer_id,
                     resolver,
                 })) => {
+                    log::debug!("Registering consumer {consumer_id}");
                     self.consumers.insert(consumer_id, resolver);
                 }
                 Poll::Ready(Some(Register::Ping { resolver })) => {
@@ -154,9 +156,12 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                 Poll::Pending => break,
             }
         }
+        log::debug!("Registrations loop terminated");
 
+        log::debug!("Looping inbound");
         loop {
-            match self.inbound.as_mut().poll_next(cx) {
+            let next = self.inbound.as_mut().poll_next(cx);
+            match next {
                 Poll::Ready(Some(Ok(msg))) => match msg {
                     Message {
                         command: BaseCommand { ping: Some(_), .. },
@@ -184,10 +189,17 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                             }
                         }
                         Some(RequestKey::Consumer { consumer_id }) => {
-                            let _ = self
-                                .consumers
-                                .get_mut(&consumer_id)
-                                .map(move |consumer| consumer.unbounded_send(msg));
+                            // log::debug!("Sending to consumer {consumer_id}");
+                            if let Some(consumer) = self.consumers.get_mut(&consumer_id) {
+                                let res = consumer.unbounded_send(msg);
+                                if let Err(err) = res {
+                                    log::error!("Error sending to consumer {consumer_id} - {err}");
+                                } else {
+                                    // log::debug!("Sent to consumer  {consumer_id}");
+                                }
+                            } else {
+                                log::warn!("No consumer_id found with id {consumer_id}");
+                            }
                         }
                         Some(RequestKey::CloseConsumer {
                             consumer_id,
@@ -463,8 +475,11 @@ impl<Exe: Executor> ConnectionSender<Exe> {
             consumer_id,
             resolver,
         }) {
-            Ok(_) => {}
-            Err(_) => {
+            Ok(_) => {
+                log::debug!("Consumer registered")
+            }
+            Err(err) => {
+                log::error!("Error registering consumer - {err}");
                 self.error.set(ConnectionError::Disconnected);
                 return Err(ConnectionError::Disconnected);
             }
@@ -487,6 +502,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         message_ids: Vec<proto::MessageIdData>,
         cumulative: bool,
     ) -> Result<(), ConnectionError> {
+        log::debug!("Sending ack to message_ids {:?}", message_ids);
         self.tx
             .unbounded_send(messages::ack(consumer_id, message_ids, cumulative))
             .map_err(|_| ConnectionError::Disconnected)
@@ -945,7 +961,7 @@ impl<Exe: Executor> Connection<Exe> {
                     registrations_rx,
                     receiver_shutdown_rx,
                 )
-                .map(|_| ()),
+                .map(|res| log::debug!("result {res:?}")),
             ))
             .is_err()
         {
@@ -956,8 +972,9 @@ impl<Exe: Executor> Connection<Exe> {
         let err = error.clone();
         let res = executor.spawn(Box::pin(async move {
             while let Some(msg) = rx.next().await {
-                // println!("real sent msg: {:?}", msg);
+                log::debug!("real sent msg: {:?}", msg);
                 if let Err(e) = sink.send(msg).await {
+                    log::error!("Interrupting rx loop - {e}");
                     err.set(e);
                     break;
                 }
