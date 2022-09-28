@@ -11,8 +11,8 @@ use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use futures::task::{Context, Poll};
 use futures::{
     channel::{mpsc, oneshot},
-    future::{select, try_join_all, Either},
-    pin_mut, Future, FutureExt, SinkExt, Stream, StreamExt,
+    future::try_join_all,
+    Future, FutureExt, SinkExt, Stream, StreamExt,
 };
 use regex::Regex;
 
@@ -905,16 +905,6 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
     async fn engine(&mut self) -> Result<(), Error> {
         debug!("starting the consumer engine for topic {}", self.topic);
 
-        let messages_rx = self.messages_rx.take()
-            .expect("message_rx is None");
-        self.register_source(messages_rx, |msg| EngineEvent::Message(msg))
-            .expect("Error registering messages_rx source");
-
-        let engine_rx = self.engine_rx.take()
-            .expect("engine_rx is None");
-        self.register_source(engine_rx, |msg| EngineEvent::EngineMessage(msg))
-            .expect("Error registering engine_rx source");
-
         loop {
             if !self.connection.is_valid() {
                 if let Some(err) = self.connection.error() {
@@ -925,6 +915,16 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                     );
                     self.reconnect().await?;
                 }
+            }
+
+            if let Some(messages_rx) = self.messages_rx.take() {
+                self.register_source(messages_rx, |msg| EngineEvent::Message(msg))
+                    .map_err(|_| Error::Custom(String::from("Error registering messages_rx source")))?;
+            }
+
+            if let Some(engine_rx) = self.engine_rx.take() {
+                self.register_source(engine_rx, |msg| EngineEvent::EngineMessage(msg))
+                    .map_err(|_| Error::Custom(String::from("Error registering engine_rx source")))?;
             }
 
             if self.remaining_messages < self.batch_size / 2 {
