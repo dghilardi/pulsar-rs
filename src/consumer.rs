@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use futures::channel::mpsc::unbounded;
+use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use futures::task::{Context, Poll};
 use futures::{
     channel::{mpsc, oneshot},
@@ -835,38 +835,35 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         }
     }
 
+    fn register_source<E, M>(&self, mut rx: UnboundedReceiver<E>, mapper: M) -> Result<(), ()>
+        where E: Send + 'static,
+              M: Fn(E) -> EngineEvent<Exe> + Send + Sync + 'static,
+    {
+        let mut event_tx = self.event_tx.clone();
+
+        self.client.executor.spawn(Box::pin(async move {
+            while let Some(msg) = rx.next().await {
+                let r = event_tx.send(mapper(msg)).await;
+                if let Err(err) = r {
+                    log::error!("Error sending event to channel - {err}");
+                }
+            }
+            log::warn!("rx terminated");
+        }))
+    }
+
     async fn engine(&mut self) -> Result<(), Error> {
         debug!("starting the consumer engine for topic {}", self.topic);
 
-        let mut messages_rx = self.messages_rx
-            .take()
+        let messages_rx = self.messages_rx.take()
             .expect("message_rx is None");
-        let mut event_msg_tx = self.event_tx.clone();
+        self.register_source(messages_rx, |msg| EngineEvent::Message(msg))
+            .expect("Error registering messages_rx source");
 
-        self.client.executor.spawn(Box::pin(async move {
-            while let Some(msg) = messages_rx.next().await {
-                let r = event_msg_tx.send(EngineEvent::Message(msg)).await;
-                if let Err(err) = r {
-                    log::error!("Message SendError - {err}");
-                }
-            }
-            log::warn!("messages_rx terminated");
-        })).expect("Error spawining Message check");
-
-        let mut engine_rx = self.engine_rx
-            .take()
+        let engine_rx = self.engine_rx.take()
             .expect("engine_rx is None");
-        let mut event_ngmsg_tx = self.event_tx.clone();
-
-        self.client.executor.spawn(Box::pin(async move {
-            while let Some(msg) = engine_rx.next().await {
-                let r = event_ngmsg_tx.send(EngineEvent::EngineMessage(msg)).await;
-                if let Err(err) = r {
-                    log::error!("EngineMessage SendError - {err}");
-                }
-            }
-            log::warn!("engine_rx terminated");
-        })).expect("Error spawining EngineMessage check");
+        self.register_source(engine_rx, |msg| EngineEvent::EngineMessage(msg))
+            .expect("Error registering engine_rx source");
 
         loop {
             if !self.connection.is_valid() {
@@ -926,7 +923,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         fut.timeout(dur).await
     }
 
-    #[cfg(all(not(feature = "async-std"),feature = "tokio"))]
+    #[cfg(all(not(feature = "async-std"), feature = "tokio"))]
     async fn timeout<F: Future<Output=O>, O>(fut: F, dur: Duration) -> Result<O, tokio::time::error::Elapsed> {
         tokio::time::timeout_at(tokio::time::Instant::now() + dur, fut).await
     }
