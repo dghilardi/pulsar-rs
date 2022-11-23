@@ -42,7 +42,7 @@ pub(crate) enum Register {
     },
     Consumer {
         consumer_id: u64,
-        resolver: mpsc::UnboundedSender<Message>,
+        resolver: mpsc::Sender<Message>,
     },
     Ping {
         resolver: oneshot::Sender<()>,
@@ -90,11 +90,12 @@ pub(crate) struct Receiver<S: Stream<Item = Result<Message, ConnectionError>>> {
     outbound: mpsc::UnboundedSender<Message>,
     error: SharedError,
     pending_requests: BTreeMap<RequestKey, oneshot::Sender<Message>>,
-    consumers: BTreeMap<u64, mpsc::UnboundedSender<Message>>,
+    consumers: BTreeMap<u64, mpsc::Sender<Message>>,
     received_messages: BTreeMap<RequestKey, Message>,
     registrations: Pin<Box<mpsc::UnboundedReceiver<Register>>>,
     shutdown: Pin<Box<oneshot::Receiver<()>>>,
     ping: Option<oneshot::Sender<()>>,
+    pending_message: Option<(u64, Message)>,
 }
 
 impl<S: Stream<Item = Result<Message, ConnectionError>>> Receiver<S> {
@@ -116,6 +117,7 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Receiver<S> {
             registrations: Box::pin(registrations),
             shutdown: Box::pin(shutdown),
             ping: None,
+            pending_message: None,
         }
     }
 }
@@ -132,6 +134,22 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
             Poll::Pending => {}
         }
 
+        if let Some((consumer_id, msg)) = self.pending_message.take() {
+            if let Some(consumer) = self.consumers.get_mut(&consumer_id) {
+                let send_out = consumer.try_send(msg);
+                match send_out {
+                    Ok(()) => {}
+                    Err(err) if err.is_full() => {
+                        self.pending_message = Some((consumer_id, err.into_inner()));
+                        return Poll::Pending;
+                    }
+                    Err(e) => {
+                        log::debug!("Error sending message to channel {e}")
+                    }
+                }
+            }
+        }
+
         //Are we worried about starvation here?
         loop {
             match self.registrations.as_mut().poll_next(cx) {
@@ -146,9 +164,9 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                     }
                 }
                 Poll::Ready(Some(Register::Consumer {
-                    consumer_id,
-                    resolver,
-                })) => {
+                                     consumer_id,
+                                     resolver,
+                                 })) => {
                     self.consumers.insert(consumer_id, resolver);
                 }
                 Poll::Ready(Some(Register::Ping { resolver })) => {
@@ -191,15 +209,24 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                             }
                         }
                         Some(RequestKey::Consumer { consumer_id }) => {
-                            let _ = self
-                                .consumers
-                                .get_mut(&consumer_id)
-                                .map(move |consumer| consumer.unbounded_send(msg));
+                            if let Some(consumer) = self.consumers.get_mut(&consumer_id) {
+                                let send_out = consumer.try_send(msg);
+                                match send_out {
+                                    Ok(()) => {}
+                                    Err(err) if err.is_full() => {
+                                        self.pending_message = Some((consumer_id, err.into_inner()));
+                                        return Poll::Pending;
+                                    }
+                                    Err(e) => {
+                                        log::debug!("Error sending message to channel {e}")
+                                    }
+                                }
+                            }
                         }
                         Some(RequestKey::CloseConsumer {
-                            consumer_id,
-                            request_id,
-                        }) => {
+                                 consumer_id,
+                                 request_id,
+                             }) => {
                             // FIXME: could the registration still be in queue while we get the
                             // CloseConsumer message?
                             if let Some(resolver) = self
@@ -208,14 +235,17 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                             {
                                 // We don't care if the receiver has dropped their future
                                 let _ = resolver.send(msg);
-                            } else {
-                                let res = self
-                                    .consumers
-                                    .get_mut(&consumer_id)
-                                    .map(move |consumer| consumer.unbounded_send(msg));
-
-                                if !res.as_ref().map(|r| r.is_ok()).unwrap_or(false) {
-                                    error!("ConnectionReceiver: error transmitting message to consumer: {:?}", res);
+                            } else if let Some(consumer) = self.consumers.get_mut(&consumer_id) {
+                                let send_out = consumer.try_send(msg);
+                                match send_out {
+                                    Ok(()) => {}
+                                    Err(err) if err.is_full() => {
+                                        self.pending_message = Some((consumer_id, err.into_inner()));
+                                        return Poll::Pending;
+                                    }
+                                    Err(e) => {
+                                        log::error!("ConnectionReceiver: error transmitting message to consumer: {e}")
+                                    }
                                 }
                             }
                         }
@@ -366,7 +396,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.lookup_topic_response
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -379,7 +409,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.partition_metadata_response
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -392,7 +422,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.consumer_stats_response
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -405,7 +435,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.get_last_message_id_response
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -421,7 +451,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.producer_success
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -432,7 +462,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.wait_exclusive_access(RequestKey::RequestId(request_id), |resp| {
             resp.command.producer_success
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -446,7 +476,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.get_topics_of_namespace_response
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -459,13 +489,13 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.success
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn subscribe(
         &self,
-        resolver: mpsc::UnboundedSender<Message>,
+        resolver: mpsc::Sender<Message>,
         topic: String,
         subscription: String,
         sub_type: SubType,
@@ -496,7 +526,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.success
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -542,7 +572,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.success
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -557,7 +587,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.success
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -570,7 +600,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.success
         })
-        .await
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -580,8 +610,8 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         key: RequestKey,
         extract: F,
     ) -> Result<R, ConnectionError>
-    where
-        F: FnOnce(Message) -> Option<R>,
+        where
+            F: FnOnce(Message) -> Option<R>,
     {
         let (resolver, response) = oneshot::channel();
         trace!("sending message(key = {:?}): {:?}", key, msg);
@@ -655,8 +685,8 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         key: RequestKey,
         extract: F,
     ) -> Result<R, ConnectionError>
-    where
-        F: FnOnce(Message) -> Option<R>,
+        where
+            F: FnOnce(Message) -> Option<R>,
     {
         let (resolver, response) = oneshot::channel();
 
@@ -730,15 +760,15 @@ impl<Exe: Executor> Connection<Exe> {
                     "pulsar+ssl" => Some(6651),
                     _ => None,
                 })
-                .map_err(|e| {
-                    error!("could not look up address: {:?}", e);
-                    e
-                })
-                .ok()
-                .map(|mut v| {
-                    v.shuffle(&mut thread_rng());
-                    v
-                })
+                    .map_err(|e| {
+                        error!("could not look up address: {:?}", e);
+                        e
+                    })
+                    .ok()
+                    .map(|mut v| {
+                        v.shuffle(&mut thread_rng());
+                        v
+                    })
             })
             .await
         {
@@ -869,7 +899,7 @@ impl<Exe: Executor> Connection<Exe> {
                         executor,
                         operation_timeout,
                     )
-                    .await
+                        .await
                 } else {
                     let stream = tokio::net::TcpStream::connect(&address)
                         .await
@@ -883,7 +913,7 @@ impl<Exe: Executor> Connection<Exe> {
                         executor,
                         operation_timeout,
                     )
-                    .await
+                        .await
                 }
             }
             #[cfg(not(feature = "tokio-runtime"))]
@@ -915,7 +945,7 @@ impl<Exe: Executor> Connection<Exe> {
                         executor,
                         operation_timeout,
                     )
-                    .await
+                        .await
                 } else {
                     let stream = async_std::net::TcpStream::connect(&address)
                         .await
@@ -929,7 +959,7 @@ impl<Exe: Executor> Connection<Exe> {
                         executor,
                         operation_timeout,
                     )
-                    .await
+                        .await
                 }
             }
             #[cfg(not(feature = "async-std-runtime"))]
@@ -948,10 +978,10 @@ impl<Exe: Executor> Connection<Exe> {
         executor: Arc<Exe>,
         operation_timeout: Duration,
     ) -> Result<ConnectionSender<Exe>, ConnectionError>
-    where
-        S: Stream<Item = Result<Message, ConnectionError>>,
-        S: Sink<Message, Error = ConnectionError>,
-        S: Send + std::marker::Unpin + 'static,
+        where
+            S: Stream<Item = Result<Message, ConnectionError>>,
+            S: Sink<Message, Error = ConnectionError>,
+            S: Send + std::marker::Unpin + 'static,
     {
         stream
             .send({
@@ -964,12 +994,12 @@ impl<Exe: Executor> Connection<Exe> {
         let msg = stream.next().await;
         match msg {
             Some(Ok(Message {
-                command:
-                    proto::BaseCommand {
-                        error: Some(error), ..
-                    },
-                ..
-            })) => Err(ConnectionError::PulsarError(
+                        command:
+                        proto::BaseCommand {
+                            error: Some(error), ..
+                        },
+                        ..
+                    })) => Err(ConnectionError::PulsarError(
                 crate::error::server_error(error.error),
                 Some(error.message),
             )),
@@ -1002,7 +1032,7 @@ impl<Exe: Executor> Connection<Exe> {
                     registrations_rx,
                     receiver_shutdown_rx,
                 )
-                .map(|_| ()),
+                    .map(|_| ()),
             ))
             .is_err()
         {
@@ -1078,8 +1108,8 @@ impl<Exe: Executor> Drop for Connection<Exe> {
 
 #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
 fn extract_message<T: Debug, F>(message: Message, extract: F) -> Result<T, ConnectionError>
-where
-    F: FnOnce(Message) -> Option<T>,
+    where
+        F: FnOnce(Message) -> Option<T>,
 {
     if let Some(e) = message.command.error {
         Err(ConnectionError::PulsarError(

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use futures::channel::mpsc::unbounded;
 use futures::task::{Context, Poll};
 use futures::{
     channel::{mpsc, oneshot},
@@ -33,6 +32,9 @@ use rand::distributions::Alphanumeric;
 use rand::Rng;
 use std::convert::TryFrom;
 use url::Url;
+
+const MESSAGES_BUFFER_SIZE: usize = 100;
+const ENGINE_EVT_BUFFER_SIZE: usize = 100;
 
 /// Configuration options for consumers
 #[derive(Clone, Default, Debug)]
@@ -463,7 +465,7 @@ pub(crate) struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(crate) config: ConsumerConfig,
     topic: String,
     messages: Pin<Box<MessageIdDataReceiver>>,
-    engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
+    engine_tx: mpsc::Sender<EngineMessage<Exe>>,
     #[allow(unused)]
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
@@ -490,7 +492,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy,
         } = config.clone();
         let consumer_id = consumer_id.unwrap_or_else(rand::random);
-        let (resolver, messages) = mpsc::unbounded();
+        let (resolver, messages) = mpsc::channel(MESSAGES_BUFFER_SIZE);
         let batch_size = batch_size.unwrap_or(1000);
 
         let mut connection = client.manager.get_connection(&addr).await?;
@@ -570,7 +572,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             })
             .map_err(|e| Error::Consumer(ConsumerError::Connection(e)))?;
 
-        let (engine_tx, engine_rx) = unbounded();
+        let (engine_tx, engine_rx) = futures::channel::mpsc::channel(ENGINE_EVT_BUFFER_SIZE);
         // drop_signal will be dropped when Consumer is dropped, then
         // drop_receiver will return, and we can close the consumer
         let (_drop_signal, drop_receiver) = oneshot::channel::<()>();
@@ -690,7 +692,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub(crate) fn acker(&self) -> mpsc::UnboundedSender<EngineMessage<Exe>> {
+    pub(crate) fn acker(&self) -> mpsc::Sender<EngineMessage<Exe>> {
         self.engine_tx.clone()
     }
 
@@ -793,10 +795,10 @@ struct ConsumerEngine<Exe: Executor> {
     id: u64,
     name: Option<String>,
     tx: mpsc::Sender<Result<(proto::MessageIdData, Payload), Error>>,
-    messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
-    engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
-    event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
-    event_tx: mpsc::UnboundedSender<EngineEvent<Exe>>,
+    messages_rx: Option<mpsc::Receiver<RawMessage>>,
+    engine_rx: Option<mpsc::Receiver<EngineMessage<Exe>>>,
+    event_rx: mpsc::Receiver<EngineEvent<Exe>>,
+    event_tx: mpsc::Sender<EngineEvent<Exe>>,
     batch_size: u32,
     remaining_messages: u32,
     unacked_message_redelivery_delay: Option<Duration>,
@@ -824,15 +826,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         id: u64,
         name: Option<String>,
         tx: mpsc::Sender<Result<(proto::MessageIdData, Payload), Error>>,
-        messages_rx: mpsc::UnboundedReceiver<RawMessage>,
-        engine_rx: mpsc::UnboundedReceiver<EngineMessage<Exe>>,
+        messages_rx: mpsc::Receiver<RawMessage>,
+        engine_rx: mpsc::Receiver<EngineMessage<Exe>>,
         batch_size: u32,
         unacked_message_redelivery_delay: Option<Duration>,
         dead_letter_policy: Option<DeadLetterPolicy>,
         options: ConsumerOptions,
         _drop_signal: oneshot::Sender<()>,
     ) -> ConsumerEngine<Exe> {
-        let (event_tx, event_rx) = mpsc::unbounded();
+        let (event_tx, event_rx) = mpsc::channel(ENGINE_EVT_BUFFER_SIZE);
         ConsumerEngine {
             client,
             connection,
@@ -856,7 +858,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         }
     }
 
-    fn register_source<E, M>(&self, mut rx: mpsc::UnboundedReceiver<E>, mapper: M) -> Result<(), ()>
+    fn register_source<E, M>(&self, mut rx: mpsc::Receiver<E>, mapper: M) -> Result<(), ()>
         where E: Send + 'static,
               M: Fn(Option<E>) -> EngineEvent<Exe> + Send + Sync + 'static,
     {
@@ -1276,7 +1278,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         self.connection = conn;
 
         let topic = self.topic.clone();
-        let (resolver, messages) = mpsc::unbounded();
+        let (resolver, messages) = mpsc::channel(MESSAGES_BUFFER_SIZE);
 
         self.connection
             .sender()
