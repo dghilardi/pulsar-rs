@@ -134,22 +134,6 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
             Poll::Pending => {}
         }
 
-        if let Some((consumer_id, msg)) = self.pending_message.take() {
-            if let Some(consumer) = self.consumers.get_mut(&consumer_id) {
-                let send_out = consumer.try_send(msg);
-                match send_out {
-                    Ok(()) => {}
-                    Err(err) if err.is_full() => {
-                        self.pending_message = Some((consumer_id, err.into_inner()));
-                        return Poll::Pending;
-                    }
-                    Err(e) => {
-                        log::debug!("Error sending message to channel {e}")
-                    }
-                }
-            }
-        }
-
         //Are we worried about starvation here?
         loop {
             match self.registrations.as_mut().poll_next(cx) {
@@ -177,6 +161,22 @@ impl<S: Stream<Item = Result<Message, ConnectionError>>> Future for Receiver<S> 
                     return Poll::Ready(Err(()));
                 }
                 Poll::Pending => break,
+            }
+        }
+
+        if let Some((consumer_id, msg)) = self.pending_message.take() {
+            if let Some(consumer) = self.consumers.get_mut(&consumer_id) {
+                let send_out = consumer.try_send(msg);
+                match send_out {
+                    Ok(()) => {}
+                    Err(err) if err.is_full() => {
+                        self.pending_message = Some((consumer_id, err.into_inner()));
+                        return Poll::Pending;
+                    }
+                    Err(e) => {
+                        log::debug!("Error sending message to channel {e}")
+                    }
+                }
             }
         }
 
