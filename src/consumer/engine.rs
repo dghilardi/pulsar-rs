@@ -202,9 +202,11 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 if !was_stable {
                     Some(Err(Error::Connection(ConnectionError::Disconnected)))
                 } else if let Err(err) = self.reconnect().await {
+                    log::debug!("Reconnection returned error - {err:?}");
                     Some(Err(err))
                 } else {
                     self.latest_reconnection = Some(SystemTime::now());
+                    log::debug!("Reconnection returned ok");
                     None
                 }
                 //return Err(Error::Consumer(ConsumerError::Connection(ConnectionError::Disconnected)).into());
@@ -741,11 +743,20 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 .await
             {
                 // Reconnection went well
-                Ok(()) => break,
+                Ok(()) => {
+                    log::debug!("Reconnection went well");
+                    break
+                },
                 // An retryable error occurs
-                Err(Ok(())) => continue,
+                Err(Ok(())) => {
+                    log::debug!("An retryable error occurs");
+                    continue
+                },
                 // An non-retryable error happens, the connection must die !
-                Err(Err(e)) => return Err(e),
+                Err(Err(e)) => {
+                    log::debug!("An non-retryable error happens, the connection must die !");
+                    return Err(e)
+                },
             }
         }
 
