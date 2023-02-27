@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use std::time::SystemTime;
 
 use futures::{
     channel::{mpsc, mpsc::UnboundedSender, oneshot},
@@ -48,6 +49,7 @@ pub struct ConsumerEngine<Exe: Executor> {
     dead_letter_policy: Option<DeadLetterPolicy>,
     options: ConsumerOptions,
     drop_signal: Option<oneshot::Sender<()>>,
+    latest_reconnection: Option<SystemTime>,
 }
 
 impl<Exe: Executor> ConsumerEngine<Exe> {
@@ -90,6 +92,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             dead_letter_policy,
             options,
             drop_signal: Some(drop_signal),
+            latest_reconnection: None,
         }
     }
 
@@ -192,9 +195,16 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         match message_opt {
             None => {
                 error!("Consumer: messages::next: returning Disconnected");
-                if let Err(err) = self.reconnect().await {
+                let was_stable = self.latest_reconnection.as_ref()
+                    .map(|latest_reconnection_ts| *latest_reconnection_ts + Duration::from_secs(120) < SystemTime::now())
+                    .unwrap_or(true);
+
+                if !was_stable {
+                    Some(Err(Error::Connection(ConnectionError::Disconnected)))
+                } else if let Err(err) = self.reconnect().await {
                     Some(Err(err))
                 } else {
+                    self.latest_reconnection = Some(SystemTime::now());
                     None
                 }
                 //return Err(Error::Consumer(ConsumerError::Connection(ConnectionError::Disconnected)).into());
